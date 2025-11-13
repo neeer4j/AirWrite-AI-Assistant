@@ -26,6 +26,7 @@ POINT_SMOOTHING = 0.25
 PINCH_ON_FRAMES = 5
 PINCH_OFF_FRAMES = 1
 FORCE_PINCH_ONLY = True  # when True, disable manual mode and force pinch as input source
+KEYBOARD_INPUT_ENABLED = False  # toggleable via 'k' during runtime; prevents accidental typing
 DEFAULT_MODEL_PATH = os.path.join("models", "airwrite_cnn.h5")
 DEFAULT_LABEL_MAP_PATH = os.path.join("models", "label_map.json")
 DEFAULT_CLASS_MAP = {
@@ -229,6 +230,7 @@ def render_ui(
     instructions = [
         "pinch (or d in manual) = pen down",
         "t = toggle pinch/manual",
+        "k = toggle keyboard input (off by default)",
         "p = predict whole canvas (append)",
         "s = save & predict",
         "keyboard: type characters to append to buffer (for testing)",
@@ -442,12 +444,18 @@ def run_airwrite(model_path: str, label_map_path: Optional[str]) -> None:
             if key == 32:  # Spacebar
                 text_buffer.append(" ")
                 last_result = None
-            # Accept printable keyboard characters to append to buffer for testing without a model
-            if 32 < key < 127 and chr(key) in "0123456789+-*/()=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz":
-                ch = chr(key)
-                text_buffer.append(ch)
-                last_result = None
-                print(f"[INFO] Appended '{ch}' to buffer (keyboard test).")
+            # Accept printable keyboard characters to append to buffer for testing when enabled
+            if KEYBOARD_INPUT_ENABLED:
+                if 32 < key < 127 and chr(key) in "0123456789+-*/()=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz":
+                    ch = chr(key)
+                    text_buffer.append(ch)
+                    last_result = None
+                    print(f"[INFO] Appended '{ch}' to buffer (keyboard test).")
+            # toggle keyboard input
+            if key == ord("k"):
+                KEYBOARD_INPUT_ENABLED = not KEYBOARD_INPUT_ENABLED
+                state = "enabled" if KEYBOARD_INPUT_ENABLED else "disabled"
+                print(f"[INFO] Keyboard input {state}. Press 'k' to toggle.")
             if key in (13, 10):  # Enter key variants
                 _, last_result = evaluate_text_buffer(text_buffer)
             if key == ord("b"):

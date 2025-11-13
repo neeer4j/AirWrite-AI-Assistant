@@ -19,10 +19,12 @@ TRAIL_LENGTH = 512
 DRAW_COLOR = (0, 255, 0)
 FINGER_TIP_ID = 8  # Mediapipe landmark index for the index fingertip
 THUMB_TIP_ID = 4
-PINCH_ON_THRESHOLD = 0.09
-PINCH_OFF_THRESHOLD = 0.12
-PINCH_SMOOTHING = 0.25
-POINT_SMOOTHING = 0.35
+PINCH_ON_THRESHOLD = 0.055
+PINCH_OFF_THRESHOLD = 0.08
+PINCH_SMOOTHING = 0.12
+POINT_SMOOTHING = 0.25
+PINCH_ON_FRAMES = 5
+PINCH_OFF_FRAMES = 1
 DEFAULT_MODEL_PATH = os.path.join("models", "airwrite_cnn.h5")
 DEFAULT_LABEL_MAP_PATH = os.path.join("models", "label_map.json")
 DEFAULT_CLASS_MAP = {
@@ -73,23 +75,83 @@ def predict_character(model, class_map: Dict[int, str], canvas: np.ndarray) -> O
     return class_map.get(predicted_index)
 
 
+def segment_and_predict(canvas: np.ndarray, model, class_map: Dict[int, str]) -> Optional[str]:
+    """Segment the canvas into blobs (left-to-right), predict each with the model and return the combined string.
+
+    Returns None if no model is loaded or nothing detected.
+    """
+    if model is None:
+        return None
+
+    gray = cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+
+    # Find contours of characters
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w * h < 100:  # ignore tiny noise
+            continue
+        boxes.append((x, y, w, h))
+
+    if not boxes:
+        return ""
+
+    # Sort bounding boxes left-to-right
+    boxes = sorted(boxes, key=lambda b: b[0])
+
+    chars: List[str] = []
+    for (x, y, w, h) in boxes:
+        pad = max(2, int(0.1 * max(w, h)))
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(canvas.shape[1], x + w + pad)
+        y1 = min(canvas.shape[0], y + h + pad)
+        roi = canvas[y0:y1, x0:x1]
+
+        # Preprocess roi similar to single-char preprocess
+        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, roi_thresh = cv2.threshold(gray_roi, 200, 255, cv2.THRESH_BINARY_INV)
+        resized = cv2.resize(roi_thresh, (28, 28), interpolation=cv2.INTER_AREA)
+        normalized = resized.astype("float32") / 255.0
+        inverted = 1.0 - normalized
+        image = img_to_array(inverted)
+        image = np.expand_dims(image, axis=0)
+
+        preds = model.predict(image, verbose=0)
+        idx = int(np.argmax(preds, axis=1)[0])
+        chars.append(class_map.get(idx, ""))
+
+    return "".join(chars)
+
+
 def evaluate_text_buffer(text_buffer: List[str]) -> Tuple[str, Optional[str]]:
     """Evaluate the buffer and produce a display message for math or plain text."""
-    text = "".join(text_buffer).strip()
-    if not text:
-        return "", None
+    raw_text = "".join(text_buffer)
+    stripped_text = raw_text.strip()
+    if not stripped_text:
+        return "", "Buffer is empty"
 
-    math_pattern = re.compile(r"^[0-9+\-*/().=\s]+$")
-    if math_pattern.fullmatch(text):
+    math_chars_pattern = re.compile(r"^[0-9+\-*/().=\s]+$")
+    if math_chars_pattern.fullmatch(stripped_text):
+        expression = stripped_text.rstrip("=").strip()
+        if not expression:
+            return stripped_text, "Math error: empty expression"
+
+        math_eval_pattern = re.compile(r"^[0-9+\-*/().\s]+$")
+        if not math_eval_pattern.fullmatch(expression):
+            return stripped_text, stripped_text
+
         try:
             safe_globals = {"__builtins__": {}}
             safe_locals = {}
-            result = eval(text, safe_globals, safe_locals)
-            return text, f"{text} = {result}"
+            result = eval(expression, safe_globals, safe_locals)
+            return expression, f"{expression} = {result}"
         except Exception as exc:  # noqa: BLE001
-            return text, f"Math error: {exc}"
+            return stripped_text, f"Math error: {exc}"
 
-    return text, text
+    return stripped_text, stripped_text
 
 
 def detect_index_finger_tip(hand_landmarks, frame_shape: Tuple[int, int]) -> Optional[Tuple[int, int]]:
@@ -133,13 +195,6 @@ def compute_pinch_distance(hand_landmarks) -> float:
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
-def update_drawing_state(distance: float, current_state: bool) -> bool:
-    """Flip the drawing state using hysteresis to reduce jitter while pinching."""
-    if current_state:
-        return distance < PINCH_OFF_THRESHOLD
-    return distance < PINCH_ON_THRESHOLD
-
-
 def render_ui(
     frame: np.ndarray,
     canvas: np.ndarray,
@@ -171,19 +226,22 @@ def render_ui(
     )
 
     instructions = [
-        "pinch (or d in manual mode) = pen down",
+        "pinch (or d in manual) = pen down",
         "t = toggle pinch/manual",
+        "p = predict whole canvas (append)",
         "s = save & predict",
-        "space = add space",
-        "enter = evaluate buffer",
+        "space = insert space",
+        "enter = evaluate (no '=' needed)",
         "b = backspace",
         "c = clear",
         "q = quit",
     ]
 
-    base_y = frame.shape[0] - 120
+    line_spacing = 22
+    bottom_margin = 12
+    base_y = frame.shape[0] - bottom_margin - (len(instructions) - 1) * line_spacing
     for idx, line in enumerate(instructions):
-        y_pos = base_y + idx * 22
+        y_pos = base_y + idx * line_spacing
         cv2.putText(
             overlay,
             line,
@@ -218,6 +276,8 @@ def run_airwrite(model_path: str, label_map_path: Optional[str]) -> None:
     canvas_last_point: Optional[Tuple[int, int]] = None
     pinch_distance_smoothed: Optional[float] = None
     smoothed_point: Optional[Tuple[float, float]] = None
+    pinch_below_frames = 0
+    pinch_above_frames = 0
 
     model, class_map = load_classifier(model_path, label_map_path)
 
@@ -259,7 +319,26 @@ def run_airwrite(model_path: str, label_map_path: Optional[str]) -> None:
                     smoothed_point = None
 
                 if use_pinch_control and pinch_distance_smoothed is not None:
-                    pen_down = update_drawing_state(pinch_distance_smoothed, pen_down)
+                    if pinch_distance_smoothed <= PINCH_ON_THRESHOLD:
+                        pinch_below_frames = min(pinch_below_frames + 1, PINCH_ON_FRAMES)
+                    else:
+                        pinch_below_frames = 0
+
+                    if pinch_distance_smoothed >= PINCH_OFF_THRESHOLD:
+                        pinch_above_frames = min(pinch_above_frames + 1, PINCH_OFF_FRAMES)
+                    else:
+                        pinch_above_frames = 0
+
+                    if pinch_distance >= PINCH_OFF_THRESHOLD * 1.2:
+                        pinch_above_frames = PINCH_OFF_FRAMES
+                        pinch_below_frames = 0
+
+                    if not pen_down and pinch_below_frames >= PINCH_ON_FRAMES:
+                        pen_down = True
+                        pinch_above_frames = 0
+                    elif pen_down and pinch_above_frames >= PINCH_OFF_FRAMES:
+                        pen_down = False
+                        pinch_below_frames = 0
 
                 indicator_color = (0, 0, 255) if pen_down else (0, 255, 255)
                 if fingertip_point:
@@ -270,6 +349,9 @@ def run_airwrite(model_path: str, label_map_path: Optional[str]) -> None:
             else:
                 smoothed_point = None
                 pinch_distance_smoothed = None if use_pinch_control else pinch_distance_smoothed
+                pinch_below_frames = 0
+                if use_pinch_control:
+                    pinch_above_frames = PINCH_OFF_FRAMES
                 if previous_pen_state:
                     append_trail_point(fingertip_trail, None)
                 if use_pinch_control:
@@ -312,6 +394,8 @@ def run_airwrite(model_path: str, label_map_path: Optional[str]) -> None:
                 fingertip_trail.clear()
                 canvas_last_point = None
                 smoothed_point = None
+                pinch_below_frames = 0
+                pinch_above_frames = PINCH_OFF_FRAMES
                 if use_pinch_control:
                     pen_down = False
             if key == ord("s"):
@@ -329,8 +413,30 @@ def run_airwrite(model_path: str, label_map_path: Optional[str]) -> None:
                 fingertip_trail.clear()
                 canvas_last_point = None
                 smoothed_point = None
+                pinch_below_frames = 0
+                pinch_above_frames = PINCH_OFF_FRAMES
                 if use_pinch_control:
                     pen_down = False
+            if key == ord("p"):
+                # Predict the whole canvas as an expression by segmenting it
+                predicted_expr = segment_and_predict(canvas, model, class_map)
+                if predicted_expr is None:
+                    print("[INFO] No model loaded - cannot predict whole canvas.")
+                elif predicted_expr == "":
+                    print("[INFO] No shapes detected on canvas to predict.")
+                else:
+                    print(f"[INFO] Predicted expression from canvas: {predicted_expr}")
+                    text_buffer.append(predicted_expr)
+                    last_result = None
+                    # clear canvas for next expression
+                    canvas.fill(255)
+                    fingertip_trail.clear()
+                    canvas_last_point = None
+                    smoothed_point = None
+                    pinch_below_frames = 0
+                    pinch_above_frames = PINCH_OFF_FRAMES
+                    if use_pinch_control:
+                        pen_down = False
             if key == 32:  # Spacebar
                 text_buffer.append(" ")
                 last_result = None
@@ -348,6 +454,8 @@ def run_airwrite(model_path: str, label_map_path: Optional[str]) -> None:
                 smoothed_point = None
                 pinch_distance_smoothed = None
                 pen_down = False
+                pinch_below_frames = 0
+                pinch_above_frames = PINCH_OFF_FRAMES
                 mode_name = "pinch" if use_pinch_control else "manual"
                 print(f"[INFO] Switched to {mode_name} drawing mode.")
             if key == ord("d"):

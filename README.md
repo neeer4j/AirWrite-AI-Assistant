@@ -21,11 +21,12 @@ python airwrite_ai_assistant.py
 - `pinch` index finger and thumb together to draw; release to reposition (manual toggle available in-app).
 - `s` &mdash; save the current canvas to `char.png`, run recognition, and append the prediction.
 - `space` &mdash; insert a space in the text buffer.
-- `enter` &mdash; evaluate the buffer; math expressions show their result.
+- `enter` &mdash; evaluate the buffer; math expressions show their result (no trailing `=` needed).
 - `c` &mdash; clear the canvas and fingertip trail.
 - `b` &mdash; backspace the latest character.
 - `t` &mdash; toggle between pinch-to-draw and manual pen control modes.
 - `q` &mdash; quit the application.
+ - `p` &mdash; segment the whole canvas, predict each character left-to-right and append the resulting expression to the buffer (draw the whole expression first, then press `p` and `enter`).
 
 ### Tech Stack
 
